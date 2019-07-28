@@ -54,6 +54,8 @@
 #define COAP_CLIENT_MAX_RETRANSMIT    4                                         /**< Maximum number of times a confirmable message can be retransmitted */
 #define COAP_CLIENT_RESP_TIMEOUT_SEC  30                                        /**< Maximum amount of time to wait for a response */
 
+// #define USE_TCP
+
 #ifdef COAP_DTLS_EN
 
 #define COAP_CLIENT_DTLS_MTU                 COAP_MSG_MAX_BUF_LEN               /**< Maximum transmission unit excluding the UDP and IPv6 headers */
@@ -198,13 +200,99 @@ static ssize_t coap_client_dtls_push_func(gnutls_transport_ptr_t data, const voi
     ssize_t num = 0;
 
     client = (coap_client_t *)data;
+#ifdef USE_TCP
+    num = send(client->sd, buf, len, 0);
+#else
     num = sendto(client->sd, buf, len, 0, (struct sockaddr *)&client->server_sin, client->server_sin_len);
+#endif
     if (num >= 0)
     {
         coap_log_debug("pushed %zd bytes", num);
     }
     return num;
 }
+
+#ifdef USE_TCP
+/**
+ *  @brief Perform a DTLS handshake with the server
+ *
+ *  @param[in,out] client Pointer to a client structure
+ *
+ *  @returns Operation success
+ *  @retval 0 Success
+ *  @retval <0 Error
+ */
+static int coap_client_tls_handshake(coap_client_t *client)
+{
+    gnutls_alert_description_t alert = 0;
+    gnutls_cipher_algorithm_t cipher = 0;
+    gnutls_mac_algorithm_t mac = 0;
+    gnutls_kx_algorithm_t kx = 0;
+    const char *cipher_suite = NULL;
+    const char *alert_name = NULL;
+    unsigned timeout = 0;
+    int ret = 0;
+    int i = 0;
+
+    coap_log_info("Initiating DTLS handshake");
+    for (i = 0; i < COAP_CLIENT_DTLS_HANDSHAKE_ATTEMPTS; i++)
+    {
+        errno = 0;
+        ret = gnutls_handshake(client->session);
+        coap_log_debug("DTLS handshake result: %s", gnutls_strerror_name(ret));
+        if ((errno != 0) && (errno != EAGAIN))
+        {
+            return -errno;
+        }
+        if (ret == GNUTLS_E_SUCCESS)
+        {
+            coap_log_info("Completed DTLS handshake");
+            /* determine which cipher suite was negotiated */
+            kx = gnutls_kx_get(client->session);
+            cipher = gnutls_cipher_get(client->session);
+            mac = gnutls_mac_get(client->session);
+            cipher_suite = gnutls_cipher_suite_get_name(kx, cipher, mac);
+            if (cipher_suite != NULL)
+                coap_log_info("Cipher suite is TLS_%s", cipher_suite);
+            else
+                coap_log_info("Cipher suite is unknown");
+            return 0;  /* success */
+        }
+        if (ret == GNUTLS_E_TIMEDOUT)
+        {
+            break;
+        }
+        if ((ret == GNUTLS_E_FATAL_ALERT_RECEIVED)
+         || (ret == GNUTLS_E_WARNING_ALERT_RECEIVED))
+        {
+            alert = gnutls_alert_get(client->session);
+            alert_name = gnutls_alert_get_name(alert);
+            if (ret == GNUTLS_E_FATAL_ALERT_RECEIVED)
+                coap_log_error("Received DTLS alert from the server: %s", alert_name);
+            else
+                coap_log_warn("Received DTLS alert from the server: %s", alert_name);
+            return -ECONNRESET;
+        }
+        if (ret != GNUTLS_E_AGAIN)
+        {
+            coap_log_error("Failed to complete DTLS handshake: %s", gnutls_strerror_name(ret));
+            return -1;
+        }
+        if (i < COAP_CLIENT_DTLS_HANDSHAKE_ATTEMPTS - 1)
+        {
+            timeout = gnutls_dtls_get_timeout(client->session);
+            coap_log_debug("Handshake timeout: %u msec", timeout);
+            ret = coap_client_dtls_listen_timeout(client, timeout);
+            if (ret < 0)
+            {
+                return ret;
+            }
+        }
+    }
+    return -ETIMEDOUT;
+}
+
+#else
 
 /**
  *  @brief Perform a DTLS handshake with the server
@@ -284,6 +372,8 @@ static int coap_client_dtls_handshake(coap_client_t *client)
     }
     return -ETIMEDOUT;
 }
+
+#endif
 
 /**
  *  @brief Verify the server's certificate
@@ -419,7 +509,7 @@ static int coap_client_dtls_create(coap_client_t *client,
         coap_log_error("Failed to initialise DTLS library: %s", gnutls_strerror_name(ret));
         return -1;
     }
-    ret = gnutls_certificate_allocate_credentials(&client->cred);
+    ret = gnutls_certificate_allocate_credentials(&client->cred); /* allocate cert */
     if (ret != GNUTLS_E_SUCCESS)
     {
         coap_log_error("Failed to allocate DTLS credentials: %s", gnutls_strerror_name(ret));
@@ -462,7 +552,11 @@ static int coap_client_dtls_create(coap_client_t *client,
         gnutls_global_deinit();
         return -1;
     }
+#ifdef USE_TCP
+    ret = gnutls_priority_init(&client->priority, NULL, NULL); /* keep default priority */
+#else
     ret = gnutls_priority_init(&client->priority, COAP_CLIENT_DTLS_PRIORITIES, NULL);
+#endif
     if (ret != GNUTLS_E_SUCCESS)
     {
         coap_log_error("Failed to initialise priorities for DTLS session: %s", gnutls_strerror_name(ret));
@@ -470,10 +564,14 @@ static int coap_client_dtls_create(coap_client_t *client,
         gnutls_global_deinit();
         return -1;
     }
-    ret = gnutls_init(&client->session, GNUTLS_CLIENT | GNUTLS_DATAGRAM | GNUTLS_NONBLOCK);
+#ifdef USE_TCP
+    ret = gnutls_init(&client->session, GNUTLS_CLIENT | GNUTLS_NONBLOCK); /* for tls */
+#else
+    ret = gnutls_init(&client->session, GNUTLS_CLIENT | GNUTLS_DATAGRAM | GNUTLS_NONBLOCK); /* for dtls */
+#endif
     if (ret != GNUTLS_E_SUCCESS)
     {
-        coap_log_error("Failed to initialise DTLS session: %s", gnutls_strerror_name(ret));
+        coap_log_error("Failed to initialise DTLS/TLS session: %s", gnutls_strerror_name(ret));
         gnutls_priority_deinit(client->priority);
         gnutls_certificate_free_credentials(client->cred);
         gnutls_global_deinit();
@@ -499,13 +597,22 @@ static int coap_client_dtls_create(coap_client_t *client,
         gnutls_global_deinit();
         return -1;
     }
-    gnutls_transport_set_ptr(client->session, client);
-    gnutls_transport_set_pull_function(client->session, coap_client_dtls_pull_func);
+    gnutls_transport_set_ptr(client->session, client); /* set raw data ptr */
+    gnutls_transport_set_pull_function(client->session, coap_client_dtls_pull_func); /* recv customized func */
     gnutls_transport_set_pull_timeout_function(client->session, coap_client_dtls_pull_timeout_func);
-    gnutls_transport_set_push_function(client->session, coap_client_dtls_push_func);
+    gnutls_transport_set_push_function(client->session, coap_client_dtls_push_func); /* send customized func */
+#ifdef USE_TCP
+#else
     gnutls_dtls_set_mtu(client->session, COAP_CLIENT_DTLS_MTU);
     gnutls_dtls_set_timeouts(client->session, COAP_CLIENT_DTLS_RETRANS_TIMEOUT, COAP_CLIENT_DTLS_TOTAL_TIMEOUT);
+#endif
+
+#ifdef USE_TCP
+    ret = coap_client_tls_handshake(client);
+#else
     ret = coap_client_dtls_handshake(client);
+#endif
+
     if (ret < 0)
     {
         gnutls_deinit(client->session);
@@ -514,6 +621,8 @@ static int coap_client_dtls_create(coap_client_t *client,
         gnutls_global_deinit();
         return ret;
     }
+#ifdef USE_TCP /* donot verify cert for now */
+#else
     ret = coap_client_dtls_verify_peer_cert(client, common_name);
     if (ret < 0)
     {
@@ -523,6 +632,7 @@ static int coap_client_dtls_create(coap_client_t *client,
         gnutls_global_deinit();
         return ret;
     }
+#endif
     return 0;
 }
 
@@ -575,7 +685,11 @@ int coap_client_create(coap_client_t *client,
     /* resolve host and port */
     hints.ai_flags = 0;
     hints.ai_family = COAP_IPV_AF_INET;  /* preferred socket domain */
+#ifdef USE_TCP
+    hints.ai_socktype = SOCK_STREAM;      /* preferred socket type */
+#else
     hints.ai_socktype = SOCK_DGRAM;      /* preferred socket type */
+#endif
     hints.ai_protocol = 0;               /* preferred protocol (3rd argument to socket()) - 0 specifies that any protocol will do */
     hints.ai_addrlen = 0;                /* must be 0 */
     hints.ai_addr = NULL;                /* must be NULL */
@@ -589,7 +703,11 @@ int coap_client_create(coap_client_t *client,
     for (node = list; node != NULL; node = node->ai_next)
     {
         if ((node->ai_family == COAP_IPV_AF_INET)
+#ifdef USE_TCP
+         && (node->ai_socktype == SOCK_STREAM))
+#else
          && (node->ai_socktype == SOCK_DGRAM))
+#endif
         {
             client->sd = socket(node->ai_family, node->ai_socktype, node->ai_protocol);
             if (client->sd < 0)
@@ -1626,4 +1744,68 @@ int coap_client_exchange(coap_client_t *client, coap_msg_t *req, coap_msg_t *res
         return coap_client_exchange_non(client, req, resp);
     }
     return -EINVAL;
+}
+
+/**
+ *  @brief Print a CoAP message
+ *
+ *  @param[in] str String to be printed before the message
+ *  @param[in] msg Pointer to a message structure
+ */
+void dump_coap_msg(const char *str, coap_msg_t *msg)
+{
+    coap_log_level_t log_level = 0;
+    coap_msg_op_t *op = NULL;
+    unsigned num = 0;
+    unsigned len = 0;
+    unsigned i = 0;
+    unsigned j = 0;
+    char *payload = NULL;
+    char *token = NULL;
+    char *val = NULL;
+
+    log_level = coap_log_get_level();
+    if (log_level < COAP_LOG_INFO)
+    {
+        return;
+    }
+    printf("%s\n", str);
+    printf("ver:         0x%02x\n", coap_msg_get_ver(msg));
+    printf("type:        0x%02x\n", coap_msg_get_type(msg));
+    printf("token_len:   %d\n", coap_msg_get_token_len(msg));
+    printf("code_class:  %d\n", coap_msg_get_code_class(msg));
+    printf("code_detail: %d\n", coap_msg_get_code_detail(msg));
+    printf("msg_id:      0x%04x\n", coap_msg_get_msg_id(msg));
+    printf("token:      ");
+    token = coap_msg_get_token(msg);
+    for (i = 0; i < coap_msg_get_token_len(msg); i++)
+    {
+        printf(" 0x%02x", (unsigned char)token[i]);
+    }
+    printf("\n");
+    op = coap_msg_get_first_op(msg);
+    while (op != NULL)
+    {
+        num = coap_msg_op_get_num(op);
+        len = coap_msg_op_get_len(op);
+        val = coap_msg_op_get_val(op);
+        printf("op[%u].num:   %u\n", j, num);
+        printf("op[%u].len:   %u\n", j, len);
+        printf("op[%u].val:  ", j);
+        for (i = 0; i < len; i++)
+        {
+            printf(" 0x%02x", (unsigned char)val[i]);
+        }
+        printf("\n");
+        op = coap_msg_op_get_next(op);
+        j++;
+    }
+    printf("payload:     ");
+    payload = coap_msg_get_payload(msg);
+    for (i = 0; i < coap_msg_get_payload_len(msg); i++)
+    {
+        printf("%c", payload[i]);
+    }
+    printf("\n");
+    printf("payload_len: %zu\n", coap_msg_get_payload_len(msg));
 }

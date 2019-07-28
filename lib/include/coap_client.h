@@ -137,4 +137,12 @@ void coap_client_destroy(coap_client_t *client);
  **/
 int coap_client_exchange(coap_client_t *client, coap_msg_t *req, coap_msg_t *resp);
 
+/**
+ *  @brief Print a CoAP message
+ *
+ *  @param[in] str String to be printed before the message
+ *  @param[in] msg Pointer to a message structure
+ */
+void dump_coap_msg(const char *str, coap_msg_t *msg);
+
 #endif
